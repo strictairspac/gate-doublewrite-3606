@@ -50,9 +50,29 @@ docker compose up -d --build --wait
 | 数据库 | MySQL 8.0 |
 | 后台执行 | Redis 通知、数据库持久任务队列和行锁、Python worker |
 
+### 巡检中断与接手续跑
+
+巡检按页落库，worker 进程失联后另一个 worker 可以接手同一批次，而不是从头再来：
+
+- 批次状态为 `queued → running → done/failed`。worker 领取批次时写入归属（`owner_id`）并把 `owner_epoch` 加一，该代次作为 fencing token；每次写页、续租或改批次状态都要求 `(owner_id, owner_epoch)` 仍是当前持有者，旧进程恢复后代次已失效，任何写页或状态变更都匹配零行而被拒绝。
+- 每个 worker 进程有唯一 `WORKER_ID`，处理期间按 `HEARTBEAT_EVERY`（10 秒）续租 `lease_expires_at`（租期 30 秒）。慢但仍有心跳的进程持续续租，批次不会被误接手；停止心跳超过租期的批次，其他 worker 可在队列扫描时接手。
+- 每页结果独立事务写入 `run_pages`，`(run_id, page_key)` 唯一约束保证中断重试不重复写已落库的页；接手方只补齐缺失页。
+- 只有全部页落齐后，才在同一事务汇总 `result`、计算 `digest` 并置为 `done`（生成批次证据），证据与状态不会出现半成品；其他批次互不影响、照常办理。
+- 接手轨迹写入审计（`claim`、`handoff`、`done`、`failed`）。巡检页面显示进度（已落库页数/总页数）、原进程与当前进程，接手并续跑完成时明确提示「原批次已接手并续跑完成」。
+
+后台故障转移的协议级测试在 `backend/tests/`（基于内存 SQLite 跑真实 SQLAlchemy 服务代码）：
+
+```sh
+python -m venv .venv && . .venv/bin/activate
+pip install -r requirements.txt
+python tests/test_failover.py
+python tests/test_api_smoke.py
+```
+
+
 从 `backend/src/domain/scenario.py` 修改业务入口和演示口径，运行 `docker compose up -d --build --wait` 查看变更。数据库表结构在 `backend/src/models` 和 `backend/migrations`，输入模型在 `backend/src/schemas`。业务页和请求接口在 `frontend/src/pages`、`frontend/src/api`。资料、执行、复核三个工作流实体各有独立表和 API；场景输入及结果保留在所属资料和批次中。
 
-角色枚举在 `backend/src/constants/roles.py`、`frontend/src/constants/roles.js`，用于服务端访问控制、账号初始化、前端导航与签署。批次状态在 `backend/src/constants/job_state.py`、`frontend/src/constants/states.js`，用于队列、状态 API、状态标记与轮询。登记、提交、完成和签署事件写入审计表。
+角色枚举在 `backend/src/constants/roles.py`、`frontend/src/constants/roles.js`，用于服务端访问控制、账号初始化、前端导航与签署。批次状态在 `backend/src/constants/job_state.py`、`frontend/src/constants/states.js`，用于队列、状态 API、状态标记与轮询，包含等待执行（queued）、巡检中（running，带租约归属）、已完成（done）与执行失败（failed）。登记、领取、接手、完成和签署事件写入审计表。
 
 `COMPOSE_PROJECT_NAME` 设置栈名，`FRONTEND_PORT`、`BACKEND_PORT`、`DB_PORT` 设置端口。通过 `DB_PASSWORD`、`JWT_SECRET`、`DEMO_PASSWORD` 配置本地凭据。设置 `SEED_DEMO=false` 可关闭演示数据载入，此时数据库初始没有演示账号。数据库密码调整后，已有数据卷需在数据库内同步修改用户密码。
 

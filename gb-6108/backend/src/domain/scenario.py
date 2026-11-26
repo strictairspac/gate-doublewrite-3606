@@ -90,26 +90,37 @@ def fault_images(page, prefix_bytes):
             return generation, intended, divergent, None
 
 
-def run(payload, parameter, db):
-    pages = normalize(payload)
-    rows = []
+def inspect_page(page, prefix_bytes):
+    """Pure, deterministic result for a single page. Safe to re-run after a crash."""
+    key = page["page"]
+    durable, target, shadow, written = fault_images(page, prefix_bytes)
+    decision = choose_copy(key, durable, target, shadow)
+    return {
+        "页号": key, "掉电阶段": EVENTS[page["event"]], "持久代": durable,
+        "目标代": target.generation, "目标校验": "通过" if target.valid(key) else "损坏",
+        "双写代": shadow.generation if shadow else None,
+        "双写校验": ("通过" if shadow.valid(key) else "损坏") if shadow else "无副本",
+        "前缀写入字节": written, "结论": decision.label, "说明": decision.note,
+        "读取文本": decision.image.data.decode() if decision.image else None,
+    }
+
+
+DECISION_METRIC = {"从双写区修复": "已修复", "隔离": "隔离页", "保留数据页": "原页通过"}
+
+
+def summarize(pages, rows):
     counts = {"已修复": 0, "隔离页": 0, "原页通过": 0}
-    metrics_by_decision = {"从双写区修复": "已修复", "隔离": "隔离页", "保留数据页": "原页通过"}
-    for page in pages:
-        key = page["page"]
-        durable, target, shadow, written = fault_images(page, parameter)
-        decision = choose_copy(key, durable, target, shadow)
-        counts[metrics_by_decision[decision.label]] += 1
-        rows.append({
-            "页号": key, "掉电阶段": EVENTS[page["event"]], "持久代": durable,
-            "目标代": target.generation, "目标校验": "通过" if target.valid(key) else "损坏",
-            "双写代": shadow.generation if shadow else None,
-            "双写校验": ("通过" if shadow.valid(key) else "损坏") if shadow else "无副本",
-            "前缀写入字节": written, "结论": decision.label, "说明": decision.note,
-            "读取文本": decision.image.data.decode() if decision.image else None,
-        })
+    for row in rows:
+        counts[DECISION_METRIC[row["结论"]]] += 1
     return {
         "summary": f"核查 {len(pages)} 页，修复 {counts['已修复']} 页，隔离 {counts['隔离页']} 页。",
         "metrics": counts,
         "rows": rows,
     }
+
+
+def run(payload, parameter, db=None):
+    # Kept for compatibility; the worker now drives inspect_page page by page so
+    # every page is durably committed independently of the others.
+    pages = normalize(payload)
+    return summarize(pages, [inspect_page(page, parameter) for page in pages])

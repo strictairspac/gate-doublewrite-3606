@@ -18,3 +18,12 @@ class RunEntry(BaseModel):
     result: dict | None
     failure: str | None
     digest: str | None
+    # Lease / handoff visibility for the inspection page.
+    owner_id: str | None = None
+    owner_epoch: int = 0
+    lease_expires_at: int | None = None
+    total_pages: int | None = None
+    landed_pages: int = 0
+    attempts: int = 0
+    last_owner_id: str | None = None
+    handed_off: bool = False
